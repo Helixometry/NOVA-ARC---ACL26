@@ -1,56 +1,40 @@
 """
 nova_arc/model.py
 -----------------
-NOVA-ARC — fully modular, component-switchable model.
+NOVA-ARC core model.
 
 Design philosophy
 -----------------
-Every layer is optional.  The user controls the architecture entirely through
-NOVAARCConfig flags.  Components can be mixed freely:
+The library does NOT handle feature extraction.
+Users extract frame-level features however they like — WavLM, wav2vec 2.0,
+voc2vec, librosa MFCCs, openSMILE, or any other tool — and pass them in as
+tensors.  NOVA-ARC handles everything from the projection into hyperbolic
+space onward.
 
-    Geometry:
-        use_hyperbolic=True   →  full Poincaré-ball pipeline
-        use_hyperbolic=False  →  pure Euclidean pipeline (all hyperbolic ops removed)
+DataLoader contract
+-------------------
+Each DataLoader must yield  (features, labels)  where:
+    features : (B, T, input_dim)   float32  frame-level feature tensor
+    labels   : (B,)                int64    class indices  0 … num_classes-1
 
-    Components (each can be turned on/off independently):
-        use_codebook  →  HVQ prosody codebook
-        use_hel       →  Hyperbolic Emotion Lens (radial calibration)
-        use_ot        →  Optimal-transport domain adaptation
+For the unlabelled target loader, pass labels as -1 (they are ignored).
 
-    Pooling (choose one):
-        pooling="attention"  →  learnable attention pooling  (default)
-        pooling="mean"       →  simple mean pooling
-        pooling="max"        →  max pooling
+Minimal usage
+-------------
+    from nova_arc import NOVAARC, NOVAARCConfig
 
-Examples
---------
-Full NOVA-ARC (paper setting)::
-
-    config = NOVAARCConfig(num_classes=5)
-    model  = NOVAARC(encoder=enc, config=config)
-
-Euclidean baseline (no hyperbolic, no OT)::
-
-    config = NOVAARCConfig(num_classes=5,
-                           use_hyperbolic=False,
-                           use_codebook=False,
-                           use_hel=False,
-                           use_ot=False)
-
-Source-only hyperbolic (no OT adaptation)::
-
-    config = NOVAARCConfig(num_classes=5, use_ot=False)
-
-Ablate HEL only::
-
-    config = NOVAARCConfig(num_classes=5, use_hel=False)
+    config = NOVAARCConfig(num_classes=5, input_dim=768)
+    model  = NOVAARC(config)
+    model.fit(source_loader, target_loader)
+    model.evaluate(test_loader)
+    model.save("checkpoint.pt")
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, Any, Literal
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -58,13 +42,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from nova_arc.hyperbolic import expmap0, logmap0, mobius_add, poincare_clip
-from nova_arc.encoders   import BaseEncoder
-from nova_arc.codebook   import HyperbolicVQCodebook
+from nova_arc.codebook    import HyperbolicVQCodebook
 from nova_arc.emotion_lens import HyperbolicEmotionLens
-from nova_arc.pooling    import HyperbolicAttentionPooling
-from nova_arc.prototypes import PrototypeBank
-from nova_arc.transport  import compute_ot
-from nova_arc.losses     import nova_arc_loss
+from nova_arc.pooling     import HyperbolicAttentionPooling
+from nova_arc.prototypes  import PrototypeBank
+from nova_arc.transport   import compute_ot
+from nova_arc.losses      import nova_arc_loss
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -72,209 +55,189 @@ from nova_arc.losses     import nova_arc_loss
 @dataclass
 class NOVAARCConfig:
     """
-    Complete configuration for NOVA-ARC.
+    Full configuration for NOVA-ARC.
 
-    Required
-    --------
-    num_classes (int):
-        Number of emotion / target classes in YOUR dataset.
-        The model builds its classifier head dynamically from this value.
+    Only  num_classes  and  input_dim  are required.
+    Everything else has sensible defaults matching the ACL 2026 paper.
+
+    Parameters
+    ----------
+    num_classes : int
+        Number of emotion (or any target) classes in your dataset.
+
+    input_dim : int
+        Dimension of the frame-level features your DataLoader provides.
+        Must match the feature extractor you used:
+            WavLM / wav2vec 2.0 / voc2vec → 768
+            MMS-1B                         → 1024
+            librosa 40-dim MFCCs           → 40
+            any custom features            → whatever your extractor outputs
 
     Architecture toggles
     --------------------
-    use_hyperbolic (bool):
-        True  → all embeddings live in the Poincaré ball (default, paper setting).
-        False → pure Euclidean pipeline; all expmap/logmap ops are identity.
+    use_hyperbolic : bool
+        True  → full Poincaré ball pipeline  (default, paper setting)
+        False → pure Euclidean; also auto-disables codebook and HEL
 
-    use_codebook (bool):
-        True  → include HVQ prosody codebook (discrete cues).
-        False → skip; continuous embedding used directly.
+    use_codebook : bool
+        True  → Hyperbolic VQ prosody codebook  (default)
+        False → skip; ablation
 
-    use_hel (bool):
-        True  → apply Hyperbolic Emotion Lens (radial calibration).
-        False → skip; useful for ablation.
+    use_hel : bool
+        True  → Hyperbolic Emotion Lens radial calibration  (default)
+        False → skip; ablation
 
-    use_ot (bool):
-        True  → include Sinkhorn OT domain adaptation during training.
-        False → source-only training (standard supervised).
+    use_ot : bool
+        True  → Sinkhorn OT domain adaptation  (default)
+        False → source-only supervised training; target_loader not needed
 
-    pooling (str):
-        "attention"  → learnable attention pooling over frames (default).
-        "mean"       → simple mean over time.
-        "max"        → max over time.
+    pooling : str
+        "attention"  learnable attention pooling over frames  (default)
+        "mean"       simple mean pooling
+        "max"        max pooling
 
     Dimensions
     ----------
-    hyperbolic_dim (int):
-        Output embedding dimension d_hyp.  The encoder output is projected to
-        this dimension before any hyperbolic operations.
+    hidden_dim : int
+        Internal Poincaré ball embedding dimension d  (default 256)
 
-    curvature (float):
-        Poincaré ball curvature c.  Use 1.0 (paper setting).
-        Only relevant when use_hyperbolic=True.
+    curvature : float
+        Poincaré ball curvature c  (κ = -c, paper uses c = 1.0)
 
     Codebook
     --------
-    codebook_size (int):      number of codewords K  (default 256)
-    commitment_weight (float): β for VQ commitment loss  (default 0.25)
-    vq_loss_weight (float):   scale on total VQ loss  (default 1.0)
+    codebook_size : int       number of codewords K  (default 256)
+    commitment_weight : float β for VQ commitment loss  (default 0.25)
+    vq_loss_weight : float    scale on total VQ loss  (default 1.0)
 
     Prototype bank
     --------------
-    frechet_iters (int):
-        Riemannian GD steps for Fréchet mean.
-        Only used when use_hyperbolic=True and use_ot=True.
+    frechet_iters : int
+        Riemannian GD steps for Fréchet mean  (default 20)
 
-    Optimal transport
+    Optimal Transport
     -----------------
-    sinkhorn_eps (float):  regularisation ε  (default 0.05)
-    sinkhorn_iters (int):  Sinkhorn iterations  (default 50)
-
-    Loss weights
-    ------------
-    lambda_opt (float):  weight on OT cost  L_OPT  (default 0.1)
-    lambda_ce (float):   weight on OT soft-CE  L_OT-CE  (default 0.1)
+    sinkhorn_eps : float    regularisation ε  (default 0.05)
+    sinkhorn_iters : int    Sinkhorn iterations  (default 50)
+    lambda_opt : float      weight on L_OPT  (default 1.0)
+    lambda_ce : float       weight on L_OT-CE  (default 1.0)
 
     Training
     --------
-    lr (float):     Adam learning rate  (default 1e-4)
-    epochs (int):   training epochs  (default 30)
-    device (str):   "cuda" / "cpu" / "mps"
+    lr : float      Adam learning rate  (default 1e-4)
+    epochs : int    training epochs  (default 30)
+    device : str    "cuda" / "cpu" / "mps"
     """
 
     # ── Required ─────────────────────────────────────────────────────────────
-    num_classes: int   # no default — must be set by user
+    num_classes : int
+    input_dim   : int
 
     # ── Architecture toggles ─────────────────────────────────────────────────
-    use_hyperbolic: bool = True
-    use_codebook:   bool = True
-    use_hel:        bool = True
-    use_ot:         bool = True
-    pooling:        str  = "attention"   # "attention" | "mean" | "max"
+    use_hyperbolic : bool = True
+    use_codebook   : bool = True
+    use_hel        : bool = True
+    use_ot         : bool = True
+    pooling        : str  = "attention"   # "attention" | "mean" | "max"
 
     # ── Dimensions ───────────────────────────────────────────────────────────
-    hyperbolic_dim: int   = 256
-    curvature:      float = 1.0
+    hidden_dim : int   = 256
+    curvature  : float = 1.0
 
     # ── Codebook ─────────────────────────────────────────────────────────────
-    codebook_size:      int   = 256
-    commitment_weight:  float = 0.25
-    vq_loss_weight:     float = 1.0
+    codebook_size      : int   = 256
+    commitment_weight  : float = 0.25
+    vq_loss_weight     : float = 1.0
 
     # ── Prototype bank ───────────────────────────────────────────────────────
-    frechet_iters: int = 20
+    frechet_iters : int = 20
 
-    # ── OT ───────────────────────────────────────────────────────────────────
-    sinkhorn_eps:   float = 0.05
-    sinkhorn_iters: int   = 50
-
-    # ── Loss weights ─────────────────────────────────────────────────────────
-    lambda_opt: float = 0.1
-    lambda_ce:  float = 0.1
+    # ── Optimal Transport ─────────────────────────────────────────────────────
+    sinkhorn_eps   : float = 0.05
+    sinkhorn_iters : int   = 50
+    lambda_opt     : float = 1.0
+    lambda_ce      : float = 1.0
 
     # ── Training ─────────────────────────────────────────────────────────────
-    lr:     float = 1e-4
-    epochs: int   = 30
-    device: str   = "cpu"
+    lr     : float = 1e-4
+    epochs : int   = 30
+    device : str   = "cpu"
 
     def __post_init__(self):
         if self.pooling not in ("attention", "mean", "max"):
             raise ValueError(
-                f"pooling must be 'attention', 'mean', or 'max', got '{self.pooling}'"
+                f"pooling must be 'attention', 'mean', or 'max'  —  got '{self.pooling}'"
             )
-        if not self.use_hyperbolic and (self.use_codebook or self.use_hel):
-            # Codebook and HEL require hyperbolic geometry — auto-disable them
+        if not self.use_hyperbolic:
+            # codebook and HEL require hyperbolic geometry
             self.use_codebook = False
             self.use_hel      = False
 
 
-# ── Internal pooling helpers ─────────────────────────────────────────────────
+# ── Internal pooling helpers ──────────────────────────────────────────────────
 
-class _MeanPooling(nn.Module):
-    def forward(self, x: torch.Tensor, mask=None):
-        # x: (B, T, d)
+class _MeanPool(nn.Module):
+    def forward(self, x, mask=None):
         if mask is not None:
-            # mask: True for valid frames
             m = mask.unsqueeze(-1).float()
             return (x * m).sum(1) / m.sum(1).clamp(min=1e-8)
         return x.mean(dim=1)
 
-
-class _MaxPooling(nn.Module):
-    def forward(self, x: torch.Tensor, mask=None):
+class _MaxPool(nn.Module):
+    def forward(self, x, mask=None):
         if mask is not None:
-            x = x.masked_fill(~mask.unsqueeze(-1), float('-inf'))
+            x = x.masked_fill(~mask.unsqueeze(-1), float("-inf"))
         return x.max(dim=1).values
 
+class _EuclideanAttnPool(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.w = nn.Parameter(torch.randn(dim) * 0.01)
+    def forward(self, x, mask=None):
+        scores = x @ self.w
+        if mask is not None:
+            scores = scores.masked_fill(~mask, float("-inf"))
+        attn = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)
+        return (attn.unsqueeze(-1) * x).sum(dim=1)
 
-# ── Main model ───────────────────────────────────────────────────────────────
+
+# ── Main model ────────────────────────────────────────────────────────────────
 
 class NOVAARC(nn.Module):
     """
     NOVA-ARC model.
 
-    All components are built dynamically from NOVAARCConfig, so the
-    architecture adapts completely to the user's settings.
+    Takes pre-extracted frame features as input — no encoder is built-in.
+    Users extract features with any tool (WavLM, wav2vec 2.0, librosa, etc.)
+    and pass them directly via their DataLoader.
 
-    Args:
-        encoder (BaseEncoder):
-            Any encoder that inherits BaseEncoder and returns (B, T, d_enc).
-            Built-in: WavLMEncoder, Wav2Vec2Encoder, Voc2VecEncoder, MMSEncoder.
-            Custom: subclass BaseEncoder and implement forward().
+    Parameters
+    ----------
+    config : NOVAARCConfig
+        Full model + training configuration.
 
-        config (NOVAARCConfig):
-            Full hyperparameter + component config.
-
-    Examples::
-
-        # Full NOVA-ARC (paper setting)
-        from nova_arc import NOVAARC, NOVAARCConfig
-        from nova_arc.encoders import WavLMEncoder
-
-        model = NOVAARC(
-            encoder = WavLMEncoder(freeze=True),
-            config  = NOVAARCConfig(num_classes=5),
-        )
-
-        # Euclidean baseline — no hyperbolic, no OT
-        model = NOVAARC(
-            encoder = WavLMEncoder(freeze=True),
-            config  = NOVAARCConfig(
-                num_classes    = 5,
-                use_hyperbolic = False,
-                use_ot         = False,
-            ),
-        )
-
-        # Custom encoder
-        class MyEncoder(BaseEncoder):
-            def __init__(self):
-                super().__init__(output_dim=512)
-                self.backbone = ...
-            def forward(self, waveforms):
-                return self.backbone(waveforms)   # (B, T, 512)
-
-        model = NOVAARC(
-            encoder = MyEncoder(),
-            config  = NOVAARCConfig(num_classes=8, hyperbolic_dim=512),
-        )
+    Example
+    -------
+    >>> from nova_arc import NOVAARC, NOVAARCConfig
+    >>> config = NOVAARCConfig(num_classes=5, input_dim=768)
+    >>> model  = NOVAARC(config)
+    >>> model.fit(source_loader, target_loader)
+    >>> model.evaluate(test_loader)
     """
 
-    def __init__(self, encoder: BaseEncoder, config: NOVAARCConfig):
+    def __init__(self, config: NOVAARCConfig):
         super().__init__()
+        self.config = config
 
-        self.config  = config
-        self.encoder = encoder
+        d   = config.hidden_dim
+        C   = config.num_classes
+        c   = config.curvature
+        inp = config.input_dim
 
-        d_enc = encoder.output_dim
-        d     = config.hyperbolic_dim
-        C     = config.num_classes
-        c     = config.curvature
+        # ── Input projection  (input_dim → hidden_dim) ───────────────────────
+        self.proj = nn.Linear(inp, d)
 
-        # ── Linear projection (always present) ───────────────────────────────
-        self.proj = nn.Linear(d_enc, d)
-
-        # ── Optional HVQ Codebook ─────────────────────────────────────────────
+        # ── Optional: HVQ Codebook ────────────────────────────────────────────
         self.codebook = (
             HyperbolicVQCodebook(
                 codebook_size     = config.codebook_size,
@@ -282,11 +245,10 @@ class NOVAARC(nn.Module):
                 commitment_weight = config.commitment_weight,
                 vq_loss_weight    = config.vq_loss_weight,
                 curvature         = c,
-            )
-            if config.use_codebook else None
+            ) if config.use_codebook else None
         )
 
-        # ── Optional HEL ─────────────────────────────────────────────────────
+        # ── Optional: Hyperbolic Emotion Lens ─────────────────────────────────
         self.hel = (
             HyperbolicEmotionLens(curvature=c)
             if config.use_hel else None
@@ -294,182 +256,149 @@ class NOVAARC(nn.Module):
 
         # ── Pooling ───────────────────────────────────────────────────────────
         if config.pooling == "attention":
-            if config.use_hyperbolic:
-                self.pooling_layer = HyperbolicAttentionPooling(dim=d, curvature=c)
-            else:
-                # Euclidean attention pooling
-                self.pooling_layer = _EuclideanAttentionPooling(dim=d)
+            self.pool = (
+                HyperbolicAttentionPooling(dim=d, curvature=c)
+                if config.use_hyperbolic else _EuclideanAttnPool(d)
+            )
         elif config.pooling == "mean":
-            self.pooling_layer = _MeanPooling()
-        else:  # "max"
-            self.pooling_layer = _MaxPooling()
+            self.pool = _MeanPool()
+        else:
+            self.pool = _MaxPool()
 
-        # ── Classifier ───────────────────────────────────────────────────────
+        # ── Classifier ────────────────────────────────────────────────────────
         self.classifier = nn.Linear(d, C)
 
-        # ── Prototype bank + OT (only when use_ot=True) ───────────────────────
-        if config.use_ot:
-            self.prototype_bank = PrototypeBank(
+        # ── Prototype bank (optional, used by OT) ────────────────────────────
+        self.prototype_bank = (
+            PrototypeBank(
                 num_classes   = C,
                 dim           = d,
                 curvature     = c,
                 frechet_iters = config.frechet_iters,
-            )
-        else:
-            self.prototype_bank = None
+            ) if config.use_ot else None
+        )
 
-    # ── Geometry helpers ──────────────────────────────────────────────────────
+    # ── geometry helpers ─────────────────────────────────────────────────────
 
     def _to_ball(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Map Euclidean tensor to Poincaré ball (only when use_hyperbolic).
+        """Soft-normalise then expmap into Poincaré ball."""
+        if not self.config.use_hyperbolic:
+            return x
+        norm = x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        x    = x / (norm + 1.0)          # soft normalise → norm < 1
+        return poincare_clip(expmap0(x, self.config.curvature), self.config.curvature)
 
-        A raw Linear layer outputs vectors whose norm grows as √d (≈11 for d=128).
-        expmap0 uses tanh(norm), which saturates to 1 for norm >> 1 and pushes
-        every point to the boundary → logmap0 / Poincaré-dist return NaN/Inf.
-
-        We apply a soft rescaling  x / (‖x‖ + 1)  that:
-          - leaves small-norm vectors nearly unchanged
-          - smoothly compresses large norms to < 1
-          - is differentiable everywhere
-        """
-        if self.config.use_hyperbolic:
-            norm = x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            x    = x / (norm + 1.0)          # soft normalise → norm < 1
-            return poincare_clip(expmap0(x, self.config.curvature), self.config.curvature)
-        return x
-
-    def _pool(self, x: torch.Tensor, mask=None) -> torch.Tensor:
-        """
-        Apply the chosen pooling and return a flat (B, d) vector in tangent space.
-        """
+    def _pool_frames(self, x: torch.Tensor, mask=None) -> torch.Tensor:
+        """Pool (B, T, d) → (B, d) in tangent space."""
         if self.config.use_hyperbolic and self.config.pooling == "attention":
-            u_tang, _ = self.pooling_layer(x, mask)
+            u_tang, _ = self.pool(x, mask)
             return u_tang
-        elif self.config.pooling == "attention":
-            return self.pooling_layer(x, mask)
-        else:
-            return self.pooling_layer(x, mask)
-
-    # ── encode ────────────────────────────────────────────────────────────────
-
-    def encode(
-        self,
-        waveforms: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Run the full encoding pipeline for a batch of waveforms.
-
-        Args:
-            waveforms: (B, T_samples)  float32, 16 kHz, normalised to [-1, 1]
-            mask:      (B, T_frames)   bool, True = valid frame  (optional)
-
-        Returns:
-            u_rep:   (B, d)   utterance representation (tangent space if hyperbolic)
-            u_hyp:   (B, d)   utterance in Poincaré ball (same as u_rep if Euclidean)
-            vq_loss: scalar   VQ loss (0.0 when use_codebook=False)
-        """
-        c       = self.config.curvature
-        vq_loss = torch.tensor(0.0, device=waveforms.device)
-
-        # 1. SSL encoder
-        feats = self.encoder(waveforms)        # (B, T, d_enc)
-
-        # 2. Project to model dim
-        feats = self.proj(feats)               # (B, T, d)
-
-        # 3. Map to Poincaré ball (no-op when Euclidean)
-        b = self._to_ball(feats)               # (B, T, d)
-
-        # 4. Optional: HVQ Codebook
-        if self.codebook is not None:
-            quantized, vq_loss, _ = self.codebook(b)
-            b = poincare_clip(mobius_add(b, quantized, c), c)
-
-        # 5. Optional: HEL calibration
-        if self.hel is not None:
-            b = self.hel(b)
-
-        # 6. Pool to utterance level
-        u_rep = self._pool(b, mask)            # (B, d)
-
-        # 7. Hyperbolic utterance embedding for OT / prototypes
-        if self.config.use_hyperbolic:
-            u_hyp = poincare_clip(expmap0(u_rep, c), c)
-        else:
-            u_hyp = u_rep
-
-        return u_rep, u_hyp, vq_loss
+        return self.pool(x, mask)
 
     # ── forward ──────────────────────────────────────────────────────────────
 
     def forward(
         self,
-        waveforms: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        features: torch.Tensor,           # (B, T, input_dim)
+        mask: Optional[torch.Tensor] = None,  # (B, T) bool, True=valid
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Full forward pass.
+        Forward pass.
 
-        Args:
-            waveforms: (B, T_samples)
-            mask:      (B, T_frames)  optional
+        Parameters
+        ----------
+        features : (B, T, input_dim)
+            Pre-extracted frame-level features.
+        mask : (B, T) bool, optional
+            True for valid frames, False for padding.
 
-        Returns:
-            logits:  (B, num_classes)
-            u_hyp:   (B, d)           utterance embedding (for OT)
-            vq_loss: scalar
+        Returns
+        -------
+        logits  : (B, num_classes)
+        u_hyp   : (B, hidden_dim)   utterance in Poincaré ball  (for OT)
+        vq_loss : scalar
         """
-        u_rep, u_hyp, vq_loss = self.encode(waveforms, mask)
-        logits = self.classifier(u_rep)
+        c       = self.config.curvature
+        vq_loss = torch.tensor(0.0, device=features.device)
+
+        # 1. Project input features to hidden_dim
+        x = self.proj(features)           # (B, T, d)
+
+        # 2. Map to Poincaré ball
+        x = self._to_ball(x)              # (B, T, d)
+
+        # 3. HVQ Codebook
+        if self.codebook is not None:
+            q, vq_loss, _ = self.codebook(x)
+            x = poincare_clip(mobius_add(x, q, c), c)
+
+        # 4. HEL calibration
+        if self.hel is not None:
+            x = self.hel(x)
+
+        # 5. Pool to utterance level
+        u = self._pool_frames(x, mask)    # (B, d)
+
+        # 6. Hyperbolic utterance embedding (for OT / prototype bank)
+        u_hyp = (
+            poincare_clip(expmap0(u, c), c)
+            if self.config.use_hyperbolic else u
+        )
+
+        # 7. Classify
+        logits = self.classifier(u)       # (B, C)
+
         return logits, u_hyp, vq_loss
 
     # ── class prior ──────────────────────────────────────────────────────────
 
     @staticmethod
     def _class_prior(labels: torch.Tensor, C: int) -> torch.Tensor:
-        counts = torch.bincount(labels, minlength=C).float()
+        counts = torch.bincount(labels.clamp(min=0), minlength=C).float()
         return counts / counts.sum().clamp(min=1e-8)
 
     # ── fit ──────────────────────────────────────────────────────────────────
 
     def fit(
         self,
-        source_loader: DataLoader,
-        target_loader: Optional[DataLoader] = None,
+        source_loader  : DataLoader,
+        target_loader  : Optional[DataLoader] = None,
         *,
-        verbose: bool = True,
+        verbose        : bool = True,
     ) -> "NOVAARC":
         """
         Train NOVA-ARC.
 
-        Each DataLoader yields ``(waveforms, labels)`` where:
-          - waveforms: ``(B, T_samples)`` float32 tensor, 16 kHz, normalised
-          - labels:    ``(B,)`` int64 tensor, class indices 0…num_classes-1
+        Parameters
+        ----------
+        source_loader : DataLoader
+            Yields (features, labels) — labelled source domain.
+            features : (B, T, input_dim)
+            labels   : (B,)  int64, class indices 0 … num_classes-1
 
-        When ``use_ot=False``, ``target_loader`` is not used and can be omitted.
+        target_loader : DataLoader, optional
+            Yields (features, labels) — unlabelled target domain.
+            features : (B, T, input_dim)
+            labels   : (B,)  ignored (can be -1)
+            Required when use_ot=True.
 
-        Args:
-            source_loader: DataLoader for labelled source domain
-            target_loader: DataLoader for unlabelled target domain
-                           (required when use_ot=True)
-            verbose:       print per-epoch loss breakdown
+        verbose : bool
+            Print per-epoch loss breakdown.
 
-        Returns:
-            self
+        Returns
+        -------
+        self
         """
         cfg    = self.config
         device = torch.device(cfg.device)
         self.to(device)
 
-        if cfg.use_ot and target_loader is None:
-            raise ValueError(
-                "target_loader is required when use_ot=True. "
-                "Pass target_loader or set use_ot=False in NOVAARCConfig."
-            )
-
         if cfg.use_ot:
+            if target_loader is None:
+                raise ValueError(
+                    "target_loader is required when use_ot=True.\n"
+                    "Either pass target_loader or set use_ot=False in NOVAARCConfig."
+                )
             self.prototype_bank.to(device)
 
         optimizer = torch.optim.Adam(
@@ -477,49 +406,48 @@ class NOVAARC(nn.Module):
             lr=cfg.lr,
         )
 
-        # Pre-compute class prior from full source label set
+        # Pre-compute class prior from source labels
         if cfg.use_ot:
-            all_labels = torch.cat([lbl for _, lbl in source_loader])
+            all_labels  = torch.cat([lbl for _, lbl in source_loader])
             class_prior = self._class_prior(all_labels, cfg.num_classes).to(device)
 
         for epoch in range(1, cfg.epochs + 1):
             self.train()
-            stats: Dict[str, float] = {
-                "total": 0.0, "L_S": 0.0, "L_OPT": 0.0, "L_OT_CE": 0.0
-            }
+            stats = {"total": 0.0, "L_S": 0.0, "L_OPT": 0.0, "L_OT_CE": 0.0}
             n = 0
 
             src_iter = iter(source_loader)
             tgt_iter = iter(target_loader) if cfg.use_ot else None
 
             while True:
+                # ── source batch ──────────────────────────────────────────────
                 try:
-                    src_wav, src_lbl = next(src_iter)
+                    src_feat, src_lbl = next(src_iter)
                 except StopIteration:
                     break
 
-                src_wav = src_wav.to(device)
-                src_lbl = src_lbl.to(device)
+                src_feat = src_feat.to(device)
+                src_lbl  = src_lbl.to(device)
 
-                src_logits, src_u_hyp, src_vq = self(src_wav)
+                src_logits, src_u_hyp, src_vq = self(src_feat)
 
                 if cfg.use_ot:
-                    # Get target batch
+                    # ── target batch ──────────────────────────────────────────
                     try:
-                        tgt_wav, _ = next(tgt_iter)
+                        tgt_feat, _ = next(tgt_iter)
                     except StopIteration:
-                        tgt_iter = iter(target_loader)
-                        tgt_wav, _ = next(tgt_iter)
+                        tgt_iter    = iter(target_loader)
+                        tgt_feat, _ = next(tgt_iter)
 
-                    tgt_wav    = tgt_wav.to(device)
-                    tgt_logits, tgt_u_hyp, tgt_vq = self(tgt_wav)
+                    tgt_feat = tgt_feat.to(device)
+                    tgt_logits, tgt_u_hyp, tgt_vq = self(tgt_feat)
 
-                    # Accumulate source embeddings for prototype refresh
+                    # accumulate source embeddings for prototype refresh
                     self.prototype_bank.accumulate(src_u_hyp.detach(), src_lbl)
 
                     # OT with current prototypes
-                    protos  = self.prototype_bank.prototypes.to(device)
-                    ot_out  = compute_ot(
+                    protos = self.prototype_bank.prototypes.to(device)
+                    ot_out = compute_ot(
                         prototypes  = protos,
                         target_hyp  = tgt_u_hyp.detach(),
                         class_prior = class_prior,
@@ -528,14 +456,13 @@ class NOVAARC(nn.Module):
                         n_iter      = cfg.sinkhorn_iters,
                     )
                     soft_labels = ot_out["soft_labels"].to(device)
-                    ot_cost     = ot_out["ot_cost"]
 
                     losses = nova_arc_loss(
                         source_logits = src_logits,
                         source_labels = src_lbl,
                         target_logits = tgt_logits,
                         soft_labels   = soft_labels,
-                        ot_cost       = ot_cost,
+                        ot_cost       = ot_out["ot_cost"],
                         lambda_opt    = cfg.lambda_opt,
                         lambda_ce     = cfg.lambda_ce,
                     )
@@ -545,9 +472,8 @@ class NOVAARC(nn.Module):
                     stats["L_OT_CE"] += losses["L_OT_CE"].item()
 
                 else:
-                    # Source-only training
-                    import torch.nn.functional as _F
-                    total = _F.cross_entropy(src_logits, src_lbl) + src_vq
+                    # source-only training
+                    total  = F.cross_entropy(src_logits, src_lbl) + src_vq
                     losses = {"L_S": total.detach()}
 
                 optimizer.zero_grad()
@@ -558,6 +484,7 @@ class NOVAARC(nn.Module):
                 stats["L_S"]   += losses["L_S"].item()
                 n += 1
 
+            # end of epoch: refresh prototypes
             if cfg.use_ot:
                 self.prototype_bank.refresh(device=device)
 
@@ -565,7 +492,7 @@ class NOVAARC(nn.Module):
                 avg = {k: v / n for k, v in stats.items()}
                 if cfg.use_ot:
                     print(
-                        f"Epoch {epoch:3d}/{cfg.epochs} | "
+                        f"Epoch {epoch:3d}/{cfg.epochs}  |  "
                         f"total={avg['total']:.4f}  "
                         f"L_S={avg['L_S']:.4f}  "
                         f"L_OPT={avg['L_OPT']:.4f}  "
@@ -573,11 +500,10 @@ class NOVAARC(nn.Module):
                     )
                 else:
                     print(
-                        f"Epoch {epoch:3d}/{cfg.epochs} | "
+                        f"Epoch {epoch:3d}/{cfg.epochs}  |  "
                         f"total={avg['total']:.4f}  "
                         f"L_S={avg['L_S']:.4f}"
                     )
-
         return self
 
     # ── evaluate ─────────────────────────────────────────────────────────────
@@ -585,17 +511,20 @@ class NOVAARC(nn.Module):
     @torch.no_grad()
     def evaluate(
         self,
-        loader: DataLoader,
-        device: Optional[torch.device] = None,
+        loader : DataLoader,
+        device : Optional[torch.device] = None,
     ) -> Dict[str, Any]:
         """
         Compute accuracy and weighted-F1 on a labelled DataLoader.
 
-        Args:
-            loader: yields (waveforms, labels)
+        Parameters
+        ----------
+        loader : DataLoader
+            Yields (features, labels).
 
-        Returns:
-            {"accuracy": float, "weighted_f1": float}
+        Returns
+        -------
+        {"accuracy": float, "weighted_f1": float}
         """
         try:
             from sklearn.metrics import f1_score
@@ -606,8 +535,8 @@ class NOVAARC(nn.Module):
         self.eval().to(device)
 
         preds, gts = [], []
-        for wav, lbl in loader:
-            logits, _, _ = self(wav.to(device))
+        for feat, lbl in loader:
+            logits, _, _ = self(feat.to(device))
             preds.append(logits.argmax(-1).cpu())
             gts.append(lbl)
 
@@ -615,8 +544,8 @@ class NOVAARC(nn.Module):
         gts   = torch.cat(gts).numpy()
 
         return {
-            "accuracy":    float((preds == gts).mean()),
-            "weighted_f1": float(f1_score(gts, preds, average="weighted")),
+            "accuracy"    : float((preds == gts).mean()),
+            "weighted_f1" : float(f1_score(gts, preds, average="weighted", zero_division=0)),
         }
 
     # ── predict ──────────────────────────────────────────────────────────────
@@ -624,78 +553,78 @@ class NOVAARC(nn.Module):
     @torch.no_grad()
     def predict(
         self,
-        loader: DataLoader,
-        device: Optional[torch.device] = None,
+        loader : DataLoader,
+        device : Optional[torch.device] = None,
     ) -> torch.Tensor:
         """
         Return predicted class indices for all samples.
 
-        Args:
-            loader: yields (waveforms,) or (waveforms, labels)
+        Parameters
+        ----------
+        loader : DataLoader
+            Yields (features,) or (features, labels) — labels are ignored.
 
-        Returns:
-            (N,) int64 predicted class indices
+        Returns
+        -------
+        (N,) int64 predicted class indices
         """
         device = device or torch.device(self.config.device)
         self.eval().to(device)
 
         preds = []
         for batch in loader:
-            wav = batch[0] if isinstance(batch, (list, tuple)) else batch
-            logits, _, _ = self(wav.to(device))
+            feat   = batch[0] if isinstance(batch, (list, tuple)) else batch
+            logits, _, _ = self(feat.to(device))
             preds.append(logits.argmax(-1).cpu())
 
         return torch.cat(preds)
 
-    # ── save / load ───────────────────────────────────────────────────────────
+    # ── save ─────────────────────────────────────────────────────────────────
 
     def save(self, path: str) -> None:
-        """Save weights + prototypes + config to a .pt file."""
+        """
+        Save model weights + prototype bank + config to a .pt checkpoint.
+
+        Parameters
+        ----------
+        path : str
+            File path, e.g. "checkpoints/nova_arc.pt"
+        """
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         ckpt = {
-            "model_state": self.state_dict(),
-            "config":      self.config.__dict__,
+            "model_state" : self.state_dict(),
+            "config"      : self.config.__dict__,
         }
         if self.prototype_bank is not None:
             ckpt["prototype_bank"] = self.prototype_bank.state_dict()
         torch.save(ckpt, path)
+        print(f"Saved -> {path}")
+
+    # ── load ─────────────────────────────────────────────────────────────────
 
     @classmethod
     def load(
         cls,
-        path:         str,
-        encoder:      BaseEncoder,
-        map_location: Optional[str] = None,
+        path         : str,
+        map_location : Optional[str] = None,
     ) -> "NOVAARC":
         """
-        Load a saved model.
+        Load a checkpoint saved by  save().
 
-        Args:
-            path:         path to .pt file written by save()
-            encoder:      same encoder architecture used during training
-            map_location: e.g. "cpu" or "cuda"
+        Parameters
+        ----------
+        path         : str   path to .pt file
+        map_location : str   e.g. "cpu" or "cuda"
+
+        Returns
+        -------
+        NOVAARC instance with loaded weights and config
         """
         ckpt   = torch.load(path, map_location=map_location or "cpu")
         config = NOVAARCConfig(**ckpt["config"])
-        model  = cls(encoder=encoder, config=config)
+        model  = cls(config)
         model.load_state_dict(ckpt["model_state"])
         if "prototype_bank" in ckpt and model.prototype_bank is not None:
             model.prototype_bank.load_state_dict(ckpt["prototype_bank"])
+        print(f"Loaded <- {path}")
         return model
-
-
-# ── Euclidean attention pooling (used when use_hyperbolic=False) ──────────────
-
-class _EuclideanAttentionPooling(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.w = nn.Parameter(torch.randn(dim) * 0.01)
-
-    def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
-        # x: (B, T, d)
-        scores = x @ self.w                          # (B, T)
-        if mask is not None:
-            scores = scores.masked_fill(~mask, float('-inf'))
-        attn   = torch.softmax(scores, dim=-1)
-        attn   = torch.nan_to_num(attn, nan=0.0)
-        return (attn.unsqueeze(-1) * x).sum(dim=1)   # (B, d)
