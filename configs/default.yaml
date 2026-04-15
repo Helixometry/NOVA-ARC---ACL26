@@ -1,0 +1,35 @@
+# NOVA-ARC default hyperparameters
+# All values correspond to NOVAARCConfig fields.
+# num_classes is NOT set here — it must be provided by the user.
+
+# ── Architecture toggles ──────────────────────────────────────────────────────
+use_hyperbolic: true     # false → pure Euclidean (also disables codebook + HEL)
+use_codebook:   true     # false → skip HVQ prosody codebook
+use_hel:        true     # false → skip Hyperbolic Emotion Lens
+use_ot:         true     # false → source-only training (no target_loader needed)
+pooling:        "attention"   # "attention" | "mean" | "max"
+
+# ── Dimensions ────────────────────────────────────────────────────────────────
+hyperbolic_dim: 256      # projection dim d_hyp; must match encoder.output_dim if no proj
+curvature:      1.0      # Poincaré ball curvature c
+
+# ── HVQ Codebook ─────────────────────────────────────────────────────────────
+codebook_size:      256
+commitment_weight:  0.25
+vq_loss_weight:     1.0
+
+# ── Prototype bank ────────────────────────────────────────────────────────────
+frechet_iters: 20
+
+# ── Optimal Transport (Sinkhorn) ──────────────────────────────────────────────
+sinkhorn_eps:   0.05
+sinkhorn_iters: 50
+
+# ── Loss weights ─────────────────────────────────────────────────────────────
+lambda_opt: 0.1
+lambda_ce:  0.1
+
+# ── Training ─────────────────────────────────────────────────────────────────
+lr:     1.0e-4
+epochs: 30
+device: "cpu"    # "cuda" | "cpu" | "mps"
