@@ -1,2 +1,9 @@
 venv/
 checkpoints/
+output_plots/
+plot curvature.py
+plotcodebook.py
+plotsinkhorn.py
+plotutilization.py
+radarchart.py
+test.py
